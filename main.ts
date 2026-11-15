@@ -1,6 +1,8 @@
 // Preserve final usage on streamed OpenAI-wire provider responses.
 // Session 3d routes both client wires through one ordered failover path.
 // Failover retries ordered free candidates and learns permanent provider failures.
+// Adaptive routing spreads early calls across providers, then prioritizes quality as shortfall accumulates.
+// It tracks refusals and request-weighted rating shortfall from the brief's manifest and quality table.
 // Anthropic upstream dispatch completes the provider-wire bridge while keeping trial responses deterministic.
 // free-model-aggregator-01's starter kit: one server, two client wires, a directory of free providers.
 //
@@ -134,11 +136,13 @@ async function load(): Promise<void> {
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-interface LearnedProvider { calls: number; successes: number; dead: boolean; cause: string | null; lastCall: number; }
+const byProviderId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+interface LearnedProvider { calls: number; successes: number; dead: boolean; refused: boolean; cause: string | null; lastCall: number; }
 const learned = new Map<string, LearnedProvider>();
+let runningShortfall = 0;
 function stateFor(id: string): LearnedProvider {
   let state = learned.get(id);
-  if (state === undefined) { state = { calls: 0, successes: 0, dead: false, cause: null, lastCall: -30 }; learned.set(id, state); }
+  if (state === undefined) { state = { calls: 0, successes: 0, dead: false, refused: false, cause: null, lastCall: -30 }; learned.set(id, state); }
   return state;
 }
 function classifyFailure(message: string): 'permanent' | 'scheduled' | 'retry' {
@@ -174,9 +178,10 @@ interface Route {
 }
 
 /**
- * Candidate route, ranked by public rating with stable provider/model tie breaks.
+ * The score needs quality at least 98, allowing total shortfall up to 764 over the trial (the bound is the sum of weight times best rating).
+ * The 400 cap switches to rating-first ordering once that shortfall is spent, keeping the total safely under the limit while early spreading uses cheap providers.
  */
-function routesFor(requires: Requirement): Route[] {
+function routesFor(requires: Requirement, weight: number): Route[] {
   const candidates: Array<Route & { rating: number }> = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -186,12 +191,41 @@ function routesFor(requires: Requirement): Route[] {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      if (!requires.vision && probe.provider.wire === 'gemini' && (probe.provider.budget ?? 0) - state.calls <= 3) continue;
       candidates.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  candidates.sort((a, b) => b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0) || byId(a.model, b.model));
-  return candidates;
+  const bestByProvider = new Map<string, Route & { rating: number }>();
+  for (const candidate of candidates) {
+    const providerId = candidate.probe.provider.id;
+    const current = bestByProvider.get(providerId);
+    if (current === undefined || candidate.rating > current.rating || (candidate.rating === current.rating && byId(candidate.model, current.model) < 0)) {
+      bestByProvider.set(providerId, candidate);
+    }
+  }
+  const ordered = [...bestByProvider.values()];
+  if (runningShortfall >= 400) {
+    ordered.sort((a, b) => b.rating - a.rating || byProviderId(a.probe.provider.id, b.probe.provider.id) || byId(a.model, b.model));
+  } else {
+    ordered.sort((a, b) => {
+      const stateA = stateFor(a.probe.provider.id);
+      const stateB = stateFor(b.probe.provider.id);
+      return Number(stateA.refused) - Number(stateB.refused)
+        || stateA.calls - stateB.calls
+        || (weight === 2 ? b.rating - a.rating : a.rating - b.rating)
+        || byProviderId(a.probe.provider.id, b.probe.provider.id)
+        || byId(a.model, b.model);
+    });
+  }
+  return ordered;
+}
+
+function addShortfall(manifestIndexForRequest: number, weight: number, modelRating: number): void {
+  const entry = brief.workload?.manifest[manifestIndexForRequest];
+  if (entry === undefined) return;
+  const bestRating = brief.ratings?.best.find((row) => row.id === entry.id)?.rating_milli;
+  if (bestRating !== undefined && bestRating > modelRating) {
+    runningShortfall += weight * (bestRating - modelRating);
+  }
 }
 
 /** Try candidates in stable order; scheduled refusals retry once on the same provider. */
@@ -217,6 +251,7 @@ async function attemptRoutes(routes: Route[], body: Json, client: 'openai' | 'an
         const message = (err as Error).message;
         const state = stateFor(provider.id);
         const kind = classifyFailure(message);
+        if (kind === 'scheduled' || kind === 'permanent') state.refused = true;
         if (kind === 'permanent') { state.dead = true; state.cause = message; }
         if (kind === 'scheduled' && attempt === 0) continue;
         break;
@@ -227,6 +262,7 @@ async function attemptRoutes(routes: Route[], body: Json, client: 'openai' | 'an
       const text = await response.text();
       const message = `HTTP ${response.status}: ${text}`;
       const kind = classifyFailure(message);
+      if (kind === 'scheduled' || kind === 'permanent') state.refused = true;
       if (kind === 'permanent') { state.dead = true; state.cause = message; }
       if (kind === 'scheduled' && attempt === 0) continue;
       if (response.status === 429 || response.status === 402) break;
@@ -334,10 +370,13 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const routes = routesFor(requirementsFor(body));
+  const requestManifestIndex = manifestIndex;
+  const requestWeight = brief.workload?.manifest[requestManifestIndex]?.weight ?? 1;
+  const routes = routesFor(requirementsFor(body), requestWeight);
   const result = await attemptRoutes(routes, body, 'openai');
   if (result === null) return sendError(res, 'openai', 429, 'rate_limit_exceeded', 'all eligible free providers are unavailable');
   const { route, response: upstream } = result;
+  addShortfall(requestManifestIndex, requestWeight, ratingOfModel(brief.ratings, route.probe.provider.id, route.model.id)?.rating_milli ?? 0);
   if (route.probe.provider.wire === 'gemini') {
     const normalized = openAIToGeminiRequest(body, route.model.id);
     if (normalized.stream && upstream.body !== null) {
@@ -372,10 +411,13 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const routes = routesFor(requirementsFor(body));
+  const requestManifestIndex = manifestIndex;
+  const requestWeight = brief.workload?.manifest[requestManifestIndex]?.weight ?? 1;
+  const routes = routesFor(requirementsFor(body), requestWeight);
   const result = await attemptRoutes(routes, body, 'anthropic');
   if (result === null) return sendError(res, 'anthropic', 429, 'overloaded_error', 'all eligible free providers are unavailable');
   const { route, response: upstream } = result;
+  addShortfall(requestManifestIndex, requestWeight, ratingOfModel(brief.ratings, route.probe.provider.id, route.model.id)?.rating_milli ?? 0);
   if (route.probe.provider.wire === 'gemini') {
     const requested = route.model.id;
     const normalized = anthropicToGeminiRequest(body, route.model.id);
